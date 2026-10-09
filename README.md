@@ -1,5 +1,7 @@
 # 校园网自动认证（可移植版）
 
+> 📦 **下载**：到 [Releases](https://github.com/lei11118/campus-autologin/releases/latest) 下载 `campus-autologin-setup-v1.1.0.exe`（一键安装）或便携 zip。
+>
 > 💡 如果你拿到的是 **`campus-autologin-setup-v1.1.0.exe`（自解压安装包）**：直接双击它，
 > 它会自动解压到 `%LOCALAPPDATA%\campus-autologin` 并立刻启动下面的安装向导
 > （解压不需要管理员；只有注册开机任务那一步会弹 UAC）。
