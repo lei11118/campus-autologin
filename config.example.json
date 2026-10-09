@@ -1,0 +1,33 @@
+{
+  "_说明": "示例配置。真正生效的是 config.json（首次运行时自动生成）。本文件只作字段参考，所有值均为占位示例。",
+  "portal": "",
+  "portal_path": "/gportal/web/login",
+  "auth_path": "/gportal/web/authLogin",
+  "nettest": "http://nettest.gwifi.com.cn",
+  "probe_204": "http://connect.rom.miui.com/generate_204",
+  "encrypt_key": "1234567887654321",
+  "username": "在这里填校园网账号（手机号/学工号）",
+  "password": "",
+  "interval_min": 5,
+  "max_fail": 3,
+  "cooldown_min": 30,
+  "startup_wait_s": 60,
+  "verify_before_fail": true,
+  "timeout_s": 8,
+  "_字段说明": {
+    "portal": "门户地址。留空=自动发现（推荐）；也可写死内网地址如 http://10.0.0.1",
+    "portal_path": "登录页路径（gportal 家族默认 /gportal/web/login）",
+    "auth_path": "认证接口路径（gportal 家族默认 /gportal/web/authLogin）",
+    "nettest": "GiWiFi 自家在线探针；其他厂商不可达时会自动降级到 probe_204",
+    "probe_204": "通用劫持探针：返回 204 = 已在线，302 = 需要认证",
+    "encrypt_key": "门户前端 JS 里 CryptoJS.AES.encrypt 用的 key（iv 由登录页下发，不要写死）",
+    "username": "校园网认证账号",
+    "password": "留空后由安装向导写入；明文 或 dpapi:<b64>(用户) / dpapim:<b64>(机器)",
+    "interval_min": "守护模式(--watch)的检查周期（分钟）",
+    "max_fail": "连续失败多少次进入冷却",
+    "cooldown_min": "冷却时长（分钟），防止把账号刷到要求验证码",
+    "startup_wait_s": "开机时等网络就绪的最长等待（秒）",
+    "verify_before_fail": "认证接口报错时先用探针复核，避免误判失败",
+    "timeout_s": "单次 HTTP 超时（秒）"
+  }
+}
