@@ -64,7 +64,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 
-__version__ = "1.1.0"      # 可移植版：门户地址可自动发现、支持无人值守(SYSTEM)模式
+__version__ = "1.2.0"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
 
 # 控制台输出兜底：即使被重定向到管道/文件，也不会因编码问题崩溃或报错
 for _s in (sys.stdout, sys.stderr):
@@ -95,6 +95,7 @@ STATE_PATH = APP_DIR / "state.json"
 LOG_DIR = APP_DIR / "logs"
 
 TASK_NAME = "GiWiFi-Campus-AutoAuth"
+TASK_NAME_WATCHDOG = "GiWiFi-Campus-AutoAuth-Watchdog"
 DPAPI_PREFIX = "dpapi:"        # 用户范围 DPAPI（只有当前 Windows 用户能解）
 DPAPI_M_PREFIX = "dpapim:"      # 机器范围 DPAPI（本机任意进程/ SYSTEM / 未登录也能解）
 
@@ -123,12 +124,20 @@ DEFAULT_CONFIG = {
     "encrypt_key": "1234567887654321",         # 门户前端硬编码的 AES key
     "username": "",
     "password": "",                            # 明文，或 "dpapi:<base64>"（用户）/ "dpapim:<base64>"（机器）密文
-    "interval_min": 5,                         # 守护/计划任务检查周期（分钟）
-    "max_fail": 3,                             # 连续失败多少次进入冷却
-    "cooldown_min": 30,                        # 冷却时长（分钟）
+    "interval_min": 5,                         # 一次性模式/守护模式的兜底周期（分钟）
+    "max_fail": 3,                             # 【仅一次性模式】连续失败多少次进入冷却
+    "cooldown_min": 30,                        # 【仅一次性模式】冷却时长（分钟）
     "startup_wait_s": 60,                      # 开机时等网络就绪的最长等待（秒）
-    "verify_before_fail": True,                # 认证接口报错时先用探针复核，避免误判失败/误入冷却
+    "verify_before_fail": True,                # 认证接口报错时先用探针复核，避免误判失败
     "timeout_s": 8,
+    # ---- 常驻守护进程（--daemon）参数：时刻盯着网络，断了立刻认证 ----
+    "watch_online_s": 25,                      # 在线时的巡检间隔（秒）；每次只发一个小请求
+    "watch_offline_s": 5,                      # 离线/无法判断时的巡检间隔（秒）
+    "retry_steps_s": [5, 10, 20, 30, 60],      # 认证失败后的重试步进（秒），封顶后一直按 60s 重试
+    "cred_retry_min": 10,                      # 判定为账号/密码类错误时的重试间隔（分钟）
+    "heartbeat_log_min": 30,                   # 稳定运行时每多少分钟写一行心跳日志
+    "daemon_stale_min": 10,                    # 看门狗判定守护进程卡死的阈值（分钟）
+    "log_max_mb": 2,                           # 单个日志文件超过多少 MB 就轮转
 }
 
 
@@ -140,15 +149,26 @@ def _log_file() -> Path:
     return LOG_DIR / f"autologin-{datetime.now():%Y%m%d}.log"
 
 
-def log(msg: str, level: str = "INFO") -> None:
+def _rotate_if_big(path: Path, max_mb: float = 2.0) -> None:
+    """日志太大就轮转（长驻进程可能连续跑几个月，磁盘占用要可控）"""
+    try:
+        if path.exists() and path.stat().st_size > max_mb * 1024 * 1024:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except Exception:
+        pass
+
+
+def log(msg: str, level: str = "INFO", max_mb: float = 2.0) -> None:
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}"
     try:
         print(line, flush=True)
     except Exception:
         pass
     try:
-        with open(_log_file(), "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        f = _log_file()
+        _rotate_if_big(f, max_mb)
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
     except Exception:
         pass
 
@@ -355,7 +375,7 @@ def resolve_password(stored: str) -> str:
 
 def lock_config_acl(path: Path) -> bool:
     """把 config.json 权限收紧到「当前用户 + SYSTEM + Administrators」，其余一律拒绝。
-    明文保存密码时靠这层保护（普通目录默认权限较宽松，这里就是最后防线）。
+    明文保存密码时靠这层保护（D:\\codx 默认是 Authenticated Users 可修改的）。
     注意：当前用户给的是 (M) 而不是 (R,W) —— Modify 含 Delete，这样
     VSCode 等编辑器/工具做「原子替换保存」时才不会 Permission denied。"""
     user = current_user()
@@ -739,11 +759,11 @@ def run_identity() -> str:
 
 
 def do_login(cfg, opener, parsed, login_url) -> tuple:
-    """执行一次认证，返回 (成功?, 说明)"""
+    """执行一次认证，返回 (成功?, 说明, reasoncode)"""
     username = cfg["username"]
     password = resolve_password(cfg["password"])
     if not username or not password:
-        return False, "未配置账号或密码（请先运行 --set-password）"
+        return False, "未配置账号或密码（请先运行 --set-password）", "NO_CREDS"
 
     idx = parsed["fields"].get("name")
     if idx is not None and not idx:
@@ -772,13 +792,13 @@ def do_login(cfg, opener, parsed, login_url) -> tuple:
     save_state(st)
 
     if code != 200:
-        return False, f"认证接口 HTTP {code}：{text[:200]}"
+        return False, f"认证接口 HTTP {code}：{text[:200]}", f"HTTP{code}"
     try:
         j = json.loads(text)
     except Exception:
-        return False, f"认证接口返回非 JSON：{text[:200]}"
+        return False, f"认证接口返回非 JSON：{text[:200]}", "BADJSON"
     if j.get("status") == 1:
-        return True, f"认证成功：{j.get('info', '')}"
+        return True, f"认证成功：{j.get('info', '')}", None
     info = j.get("info", "")
     reason = (j.get("data") or {}).get("reasoncode") if isinstance(j.get("data"), dict) else None
     hint = {
@@ -791,7 +811,27 @@ def do_login(cfg, opener, parsed, login_url) -> tuple:
     msg = f"认证被拒绝：status={j.get('status')} reasoncode={reason} info={info}"
     if hint and hint not in info:
         msg += f"（{hint}）"
-    return False, msg
+    return False, msg, str(reason)
+
+
+# 认证失败归类：判断"是不是账号密码问题"。
+# 关键教训（实测）：GiWiFi 会返回 reasoncode=1 + info="终端已认证（账号或密码错误）" ——
+# 字面上带"密码错误"，其实是 **AC 侧还挂着旧会话**，不是凭据问题。
+# 早期版本把它当失败计入冷却，导致一次断网被锁 30 分钟。这里必须按 reasoncode 精确分类。
+CRED_CODES = {"16", "32", "40", "41"}
+
+
+def is_credential_error(reason, msg: str) -> bool:
+    if reason == "NO_CREDS":
+        return True
+    if reason in CRED_CODES:
+        return True
+    if str(reason) == "1" and "已认证" in (msg or ""):
+        return False          # 终端已认证 = AC 侧会话冲突，属于瞬时问题
+    text = msg or ""
+    if "已认证" in text:
+        return False
+    return ("密码错误" in text) or ("账号不存在" in text)
 
 
 # =============================================================================
@@ -843,7 +883,7 @@ def run_once(cfg, force: bool = False, verbose: bool = True) -> int:
         log(f"准备阶段失败：{e}", "ERROR")
         return 2
 
-    ok, msg = do_login(eff, opener, parsed, login_url)
+    ok, msg, reason = do_login(eff, opener, parsed, login_url)
     if not ok:
         log(msg, "ERROR")
         # 接口虽然报错，但探针显示已在线（多设备/别的终端已认证/接口口径差异）：
@@ -882,17 +922,314 @@ def run_once(cfg, force: bool = False, verbose: bool = True) -> int:
     return 1
 
 
-def watch(cfg) -> int:
-    log(f"守护模式启动，每 {cfg['interval_min']} 分钟检查一次（Ctrl+C 退出）")
+# =============================================================================
+# 常驻守护进程（--daemon）：时刻盯着网络状态，一断就认证，低占用
+#
+# 设计取舍（都是踩坑换来的）：
+#   * 不再用"计划任务每分钟拉一个 pythonw"，改成一个常驻进程：省掉 1440 次/天的进程创建；
+#     空闲时基本在 sleep，CPU≈0，内存 ~15MB。
+#   * 自适应节拍：在线时 25s 一个小请求；掉线时 2~5s 快速重试；失败用 5→10→20→30→60s 退避，**永不长时间停摆**。
+#   * **不再有 30 分钟冷却**：实测服务端 reasoncode=1「终端已认证」被误判成凭据错误 → 冷却 30 分钟
+#     → 明明能重连却干等半小时。现在只有真正的账号/密码类错误才放慢到每 10 分钟一次。
+#   * 只在"状态变化 + 每次认证结果 + 每 30 分钟心跳"时写日志（原来每分钟一行，日志膨胀 30 倍）。
+#   * 自愈：daemon.lock 记录 PID + 心跳；看门狗任务（--ensure-running）发现进程没了/卡死了就重启它。
+# =============================================================================
+DAEMON_LOCK = APP_DIR / "daemon.lock"
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def pid_state(pid: int) -> str:
+    """返回 'alive' / 'dead' / 'unknown'。
+
+    必须区分 unknown：实测踩坑 —— 普通用户身份 OpenProcess 一个 **SYSTEM 进程**会失败，
+    若把它当成 dead，就会把正常工作的 SYSTEM 守护进程误判成已死、又拉起一个重复的。
+    ERROR_INVALID_PARAMETER(87) = 确实没有这个进程；ERROR_ACCESS_DENIED(5) = 存在但无权查。"""
+    if not pid:
+        return "dead"
+    PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+    h = _k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        err = ctypes.get_last_error()
+        return "dead" if err == 87 else "unknown"
+    try:
+        code = ctypes.wintypes.DWORD()
+        if not _k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return "unknown"
+        return "alive" if code.value == STILL_ACTIVE else "dead"
+    finally:
+        _k32.CloseHandle(h)
+
+
+def pid_alive(pid: int) -> bool:
+    return pid_state(pid) == "alive"
+
+
+def read_lock() -> dict:
+    try:
+        return json.loads(DAEMON_LOCK.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_lock(pid: int, state: str = "STARTING") -> None:
+    try:
+        DAEMON_LOCK.write_text(json.dumps(
+            {"pid": pid, "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "state": state},
+            ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def daemon_status(cfg) -> tuple:
+    """返回 (是否在跑, 信息, 心跳多久没更新(秒))
+
+    判定以**心跳**为准（state.json 里的 daemon.last_beat_ts，守护进程每轮自己写）：
+    * 心跳新鲜  → 认定在跑。哪怕我们无权探测那个进程（例如它是 SYSTEM 身份、我们是普通用户）；
+    * 心跳过期  → 再看 PID 状态，区分"卡死(仍在)"和"已退出"。
+    """
+    info = read_lock()
+    st = load_state().get("daemon") or {}
+    pid = int(st.get("pid") or info.get("pid") or 0)
+    hb = float(st.get("last_beat_ts") or 0)
+    age = (time.time() - hb) if hb else 1e9
+    stale = int(cfg.get("daemon_stale_min", 10)) * 60
+    merged = dict(info)
+    merged.update({k: v for k, v in st.items() if v is not None})
+    merged["pid"] = pid
+    if age < stale:
+        return True, merged, age
+    return (pid_state(pid) == "alive"), merged, age
+
+
+def write_heartbeat(state_str: str, extra: dict = None) -> None:
+    st = load_state()
+    d = st.get("daemon") or {}
+    d.update({"pid": os.getpid(), "last_beat_ts": time.time(),
+              "last_beat_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+              "state": state_str})
+    if extra:
+        d.update(extra)
+    st["daemon"] = d
+    save_state(st)
+    # 锁文件丢了/被别人占了就顺手补回来（自愈，避免看门狗误判后重复拉起）
+    try:
+        li = read_lock()
+        if int(li.get("pid") or 0) != os.getpid():
+            write_lock(os.getpid(), state_str)
+    except Exception:
+        pass
+
+
+def attempt_auth(cfg, discovered=None) -> tuple:
+    """做一次完整认证尝试，返回 (kind, 说明)；kind ∈ ok / cred / transient"""
+    eff = dict(cfg)
+    eff.update(resolve_portal(cfg))
+    opener = make_opener()
+    try:
+        html, login_url, parsed = fetch_login_page(eff, opener, discovered)
+    except Exception as e:
+        return "transient", f"准备阶段失败：{e}"
+    ok, msg, reason = do_login(eff, opener, parsed, login_url)
+    if ok:
+        return "ok", msg
+    # 接口报错但探针说已在线 → 视为成功（多设备/已在别处登录/接口口径差异）
+    if cfg.get("verify_before_fail", True):
+        try:
+            st, why, _ = check_online(cfg)
+            if st == ONLINE:
+                return "ok", f"接口报错但探针确认已在线（{why}）"
+        except Exception:
+            pass
+    if is_credential_error(reason, msg):
+        return "cred", msg
+    return "transient", msg
+
+
+def cmd_daemon(cfg) -> int:
+    """常驻主循环"""
+    running, info, age = daemon_status(cfg)
+    other = int(info.get("pid") or 0)
+    if running and other != os.getpid():
+        log(f"已有守护进程在运行（PID {other}，心跳 {age:.0f}s 前），本实例退出")
+        return 0
+    if (not running) and other and other != os.getpid() and pid_state(other) == "alive":
+        log(f"另一个守护进程（PID {other}）心跳已过期但进程仍在（疑似卡死），"
+            f"交给看门狗处理，本实例退出", "WARN")
+        return 0
+    write_lock(os.getpid(), "STARTING")
+
+    online_s = max(5, int(cfg.get("watch_online_s", 25)))
+    offline_s = max(2, int(cfg.get("watch_offline_s", 5)))
+    steps = list(cfg.get("retry_steps_s") or [5, 10, 20, 30, 60])
+    cred_s = max(60, int(cfg.get("cred_retry_min", 10)) * 60)
+    hb_log_s = max(60, int(cfg.get("heartbeat_log_min", 30)) * 60)
+    cfg_mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0
+
+    log(f"守护进程启动 (PID {os.getpid()}，身份 {run_identity()})："
+        f"在线每 {online_s}s 巡检；离线/失败按 {steps} 秒退避（封顶 {steps[-1]}s）；"
+        f"账号类错误每 {cred_s // 60} 分钟重试一次")
+    state, backoff, fails = "START", 0, 0
+    last_hb_log = time.time()
+    t_start = time.time()
+
     while True:
         try:
-            run_once(cfg)
+            # 配置文件被改过就热加载（改了密码不用重启守护进程）
+            try:
+                m = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0
+                if m != cfg_mtime:
+                    cfg_mtime = m
+                    cfg = load_config()
+                    log("检测到 config.json 变化，已热加载新配置")
+            except Exception:
+                pass
+
+            status, why, discovered = check_online(cfg)
+
+            if status == ONLINE:
+                if state != ONLINE:
+                    if state == "START":
+                        log(f"启动检查：网络正常（{why}）")
+                    else:
+                        log(f"网络已恢复正常（{why}）")
+                state, backoff, fails = ONLINE, 0, 0
+                sleep_s = online_s
+                write_heartbeat("ONLINE")
+
+            elif status == NEED_AUTH:
+                if state != NEED_AUTH:
+                    log(f"检测到需要认证：{why}")
+                state = NEED_AUTH
+                t0 = time.time()
+                kind, msg = attempt_auth(cfg, discovered)
+                dt = time.time() - t0
+                if kind == "ok":
+                    log(f"{msg}（耗时 {dt:.1f}s）")
+                    backoff, fails = 0, 0
+                    sleep_s = 2          # 稍等再复核，确认真的通网
+                    write_heartbeat("ONLINE", {"last_ok_ts": time.time()})
+                elif kind == "cred":
+                    fails += 1
+                    log(f"{msg} —— 判定为账号/密码类问题，改为每 {cred_s // 60} 分钟重试一次"
+                        f"（可运行 --set-password 修改）", "WARN")
+                    sleep_s = cred_s
+                    write_heartbeat("NEED_AUTH_CREDS", {"fails": fails})
+                else:
+                    fails += 1
+                    sleep_s = steps[min(backoff, len(steps) - 1)]
+                    backoff += 1
+                    log(f"{msg} —— {sleep_s}s 后重试（连续第 {fails} 次失败，不会长时间停摆）", "WARN")
+                    write_heartbeat("NEED_AUTH_RETRY", {"fails": fails})
+
+            else:  # UNKNOWN：不在校园网 / 网卡没起来 / DHCP 没拿到地址
+                if state != UNKNOWN:
+                    log(f"无法判断联网状态：{why} —— 每 {offline_s}s 继续探测（不尝试登录）")
+                state = UNKNOWN
+                fails += 1
+                sleep_s = offline_s if fails < 20 else 30     # 长时间不在网内就放慢到 30s
+                write_heartbeat("UNKNOWN", {"fails": fails})
+
+            # 稳定运行时的心跳日志：每 30 分钟一行，避免日志膨胀
+            if time.time() - last_hb_log > hb_log_s:
+                up = int(time.time() - t_start)
+                log(f"心跳：状态={state}，已连续运行 {up // 3600}h{up % 3600 // 60}m，"
+                    f"本轮累计失败 {fails} 次")
+                last_hb_log = time.time()
+
+            time.sleep(sleep_s)
+
         except KeyboardInterrupt:
-            log("收到中断，退出守护模式")
+            log("收到中断，守护进程退出")
             return 0
         except Exception as e:
-            log(f"本轮异常：{type(e).__name__}: {e}", "ERROR")
-        time.sleep(max(1, int(cfg["interval_min"])) * 60)
+            log(f"守护循环异常：{type(e).__name__}: {e}（{offline_s}s 后继续）", "ERROR")
+            try:
+                write_heartbeat("ERROR")
+            except Exception:
+                pass
+            time.sleep(offline_s)
+
+
+def cmd_ensure_running(cfg) -> int:
+    """看门狗：守护进程没了就拉起来，卡死了就杀掉重拉（由计划任务每 5 分钟调用一次）"""
+    running, info, age = daemon_status(cfg)
+    if running:
+        return 0                      # 一切正常，安静退出（不写日志，避免刷屏）
+    pid = int(info.get("pid") or 0)
+    if pid and pid_alive(pid):
+        log(f"守护进程 PID {pid} 心跳已 {age / 60:.0f} 分钟没更新（判定卡死），强制重启", "WARN")
+        run_cmd(["taskkill", "/PID", str(pid), "/F", "/T"])
+        time.sleep(1)
+    log("看门狗：未发现存活的守护进程，正在拉起 ...")
+    return cmd_start(cfg)
+
+
+def cmd_start(cfg) -> int:
+    """把守护进程拉起来（分离运行，不占用调用者的控制台）"""
+    running, info, _ = daemon_status(cfg)
+    if running:
+        print(f"守护进程已在运行（PID {info.get('pid')}）")
+        return 0
+    pw = pythonw_path()
+    script = str(Path(__file__).resolve())
+    try:
+        p = subprocess.Popen([pw, script, "--daemon"], cwd=str(APP_DIR),
+                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception as e:
+        log(f"拉起守护进程失败：{e}", "ERROR")
+        print(f"！拉起失败：{e}")
+        return 1
+    time.sleep(2.5)
+    running, info, _ = daemon_status(cfg)
+    if running:
+        log(f"守护进程已启动（PID {info.get('pid')}）")
+        print(f"守护进程已启动（PID {info.get('pid')}）")
+        return 0
+    print("！守护进程启动后未能确认存活，请看日志")
+    return 1
+
+
+def cmd_stop(cfg) -> int:
+    """停止守护进程"""
+    _, info, _ = daemon_status(cfg)
+    pid = int(info.get("pid") or 0)
+    state = pid_state(pid) if pid else "dead"
+    if pid and state != "dead":
+        rc, out = run_cmd(["taskkill", "/PID", str(pid), "/F", "/T"])
+        if rc == 0:
+            log(f"已停止守护进程（PID {pid}）")
+            print(f"已停止守护进程（PID {pid}）")
+        else:
+            msg = out.strip()[:160] or "taskkill 失败"
+            log(f"停止守护进程失败（PID {pid}）：{msg}", "WARN")
+            print(f"！停止失败（PID {pid}）：{msg}")
+            if state == "unknown":
+                print("   提示：该守护进程可能是 SYSTEM 身份，需要用管理员权限执行本命令。")
+            return 1
+    else:
+        print("没有正在运行的守护进程")
+    try:
+        DAEMON_LOCK.unlink()
+    except Exception:
+        pass
+    # 清掉心跳，避免看门狗以为它还活着
+    st = load_state()
+    if st.get("daemon"):
+        st["daemon"]["last_beat_ts"] = 0
+        st["daemon"]["state"] = "STOPPED"
+        save_state(st)
+    return 0
+
+
+def watch(cfg) -> int:
+    """--watch 现在等价于 --daemon（保留旧名字兼容）"""
+    return cmd_daemon(cfg)
 
 
 # =============================================================================
@@ -920,20 +1257,68 @@ def pythonw_path() -> str:
     return str(pw if pw.exists() else exe)
 
 
-def task_xml(pythonw: str, script: Path, mode: str = "boot", principal: str = None) -> str:
-    """mode='boot'  —— 开机即运行，以 SYSTEM 身份，**不需要任何人登录 Windows**
-                        （无人值守 / 远程控制必须用这个；注册需要管理员权限）
-       mode='logon' —— 用户登录后运行，以当前用户身份（无需管理员权限，但没登录就不工作）
+def task_xml(pythonw: str, script: Path, mode: str = "boot", principal: str = None,
+             kind: str = "once") -> str:
+    """生成计划任务 XML。
+
+    mode='boot'  —— SYSTEM 身份，不需要任何人登录 Windows（无人值守）
+    mode='logon' —— 当前用户身份（无需管理员）
+    kind='daemon'  —— 【推荐】常驻守护进程：开机拉起后一直活着，内部自适应巡检
+    kind='once'    —— 每次触发只检查一次（老模式，兜底用）
+    kind='watchdog'—— 看门狗：定期确认守护进程活着，死了就拉起
 
     注意（踩过的坑）：运行内置服务账号(SYSTEM)时**不能**写 <LogonType>ServiceAccount</LogonType>，
     那不是合法的枚举值，schtasks 会报「任务 XML 包含格式不正确或超出范围的值 (26,35):LogonType:ServiceAccount」。
     正确做法是省略 LogonType，只写 UserId=S-1-5-18，由系统推断为服务账号令牌。"""
     user = current_user()
     script = Path(script)          # 允许传 str 或 Path
+
+    # ---------- 运行身份 ----------
     if mode == "boot":
         if principal is None:
             principal = BOOT_PRINCIPALS[0][1]
+    else:
+        principal = (f"<UserId>{user}</UserId>\n"
+                     "      <LogonType>InteractiveToken</LogonType>\n"
+                     "      <RunLevel>LeastPrivilege</RunLevel>")
+
+    # ---------- 触发器 / 动作 / 设置（按 kind 区分）----------
+    if kind == "daemon":
         triggers = """
+    <!-- 开机后 30 秒拉起常驻守护进程（此后它自己一直跑，不需要重复触发） -->
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Delay>PT30S</Delay>
+    </BootTrigger>"""
+        arguments = f'"{script}" --daemon'
+        # PT0S = 不限制运行时长（常驻进程必须）
+        time_limit = "PT0S"
+        extra = """    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+"""
+        desc = ("GiWiFi 校园网自动认证（常驻守护）：开机即以 SYSTEM 身份启动，"
+                "持续监测网络，一旦掉线立刻自动认证；由看门狗任务保证长期存活。")
+    elif kind == "watchdog":
+        triggers = """
+    <!-- 每 5 分钟确认守护进程是否存活；它退出/卡死就重新拉起 -->
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>"""
+        arguments = f'"{script}" --ensure-running'
+        time_limit = "PT5M"
+        extra = ""
+        desc = "GiWiFi 校园网自动认证（看门狗）：定期检查常驻守护进程，发现其退出或卡死就重启。"
+    else:  # once
+        if mode == "boot":
+            triggers = """
     <!-- 开机后 30 秒先跑一次（此时网络可能还没就绪，脚本内部会等） -->
     <BootTrigger>
       <Enabled>true</Enabled>
@@ -949,13 +1334,8 @@ def task_xml(pythonw: str, script: Path, mode: str = "boot", principal: str = No
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
     </TimeTrigger>"""
-        desc = ("GiWiFi 校园网自动认证（无人值守）：开机即以 SYSTEM 身份检测并自动登录，"
-                "每分钟巡检保持在线，无需任何人登录 Windows。")
-    else:
-        principal = (f"<UserId>{user}</UserId>\n"
-                     "      <LogonType>InteractiveToken</LogonType>\n"
-                     "      <RunLevel>LeastPrivilege</RunLevel>")
-        triggers = f"""
+        else:
+            triggers = f"""
     <LogonTrigger>
       <Enabled>true</Enabled>
       <StartBoundary>2020-01-01T00:00:00</StartBoundary>
@@ -966,7 +1346,13 @@ def task_xml(pythonw: str, script: Path, mode: str = "boot", principal: str = No
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
     </LogonTrigger>"""
-        desc = "GiWiFi 校园网自动认证：登录后检测是否需要认证，需要则自动登录。"
+        arguments = f'"{script}" --task'
+        time_limit = "PT10M"
+        extra = ""
+        desc = ("GiWiFi 校园网自动认证："
+                + ("开机即以 SYSTEM 身份检测并自动登录，每分钟巡检保持在线，无需任何人登录 Windows。"
+                   if mode == "boot" else "登录后检测是否需要认证，需要则自动登录。"))
+
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -995,13 +1381,13 @@ def task_xml(pythonw: str, script: Path, mode: str = "boot", principal: str = No
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>
     <Priority>7</Priority>
-  </Settings>
+{extra}  </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>{pythonw}</Command>
-      <Arguments>"{script}" --task</Arguments>
+      <Arguments>{arguments}</Arguments>
       <WorkingDirectory>{script.parent}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -1030,9 +1416,58 @@ def ask_elevate(extra_args: list) -> bool:
     return True
 
 
+def register_task(name: str, script: Path, mode: str, kind: str, verbose: bool = False) -> bool:
+    """注册单个计划任务；boot 模式下按 BOOT_PRINCIPALS 逐个身份写法尝试"""
+    xml_path = APP_DIR / f"task-{kind}.xml"
+    variants = BOOT_PRINCIPALS if mode == "boot" else [("当前用户", None)]
+    for label, principal in variants:
+        xml_path.write_text(
+            task_xml(pythonw_path(), script, mode, principal, kind), encoding="utf-16")
+        rc, out = run_cmd(["schtasks", "/Create", "/TN", name, "/XML", str(xml_path), "/F"])
+        if verbose:
+            print(out[:600])
+        if rc == 0:
+            print(f"  [OK] {name}（{kind}，身份：{label}）")
+            log(f"计划任务已注册（{name}, mode={mode}, kind={kind}, principal={label}）")
+            return True
+        log(f"计划任务注册失败（{name}/{kind}/{label}）：{out}", "ERROR")
+        print(f"  [!] 该写法被拒绝（{label}）：{out.strip()[-200:]}")
+    return False
+
+
+def verify_daemon(cfg, timeout: int = 90) -> bool:
+    """验证常驻守护进程能被计划任务拉起并写日志（无人值守链路的最终验收）"""
+    logf = _log_file()
+    before = logf.stat().st_size if logf.exists() else 0
+    rc, out = run_cmd(["schtasks", "/Run", "/TN", TASK_NAME])
+    if rc != 0:
+        print(f"  ！无法手动触发守护任务：{out}")
+        return False
+    print("  已触发守护任务，等待它启动 ...")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(2)
+        if logf.exists() and logf.stat().st_size > before:
+            raw = logf.read_bytes()[before:]
+            new = raw.decode("utf-8", "replace").strip()
+            print("  --- 任务实际输出 ---")
+            for line in new.splitlines()[-8:]:
+                print("     " + line)
+            print("  --------------------")
+            if "守护进程启动" in new:
+                print("  验证通过：守护进程已由计划任务拉起。")
+                return True
+            if "已有守护进程在运行" in new:
+                print("  验证通过：守护进程本来就在运行（任务本身正常）。")
+                return True
+            print("  任务能运行，但结果需要留意（见上方日志）。")
+            return True
+    print(f"  ！{timeout} 秒内没看到守护进程启动日志。")
+    return False
+
+
 def verify_task_run(cfg, timeout: int = 60) -> bool:
-    """立即手动触发一次计划任务，确认它真的能跑通（SYSTEM 身份下能否解密密码、
-    能否写日志，这一步是无人值守场景最关键的验证）"""
+    """【一次性模式】立即触发任务，确认能跑通（SYSTEM 身份下能否读密码/写日志）"""
     logf = _log_file()
     before = logf.stat().st_size if logf.exists() else 0
     rc, out = run_cmd(["schtasks", "/Run", "/TN", TASK_NAME])
@@ -1082,53 +1517,74 @@ def install_task(cfg, mode: str = "boot", verbose: bool = False, verify: bool = 
         if not ask_elevate(["--install-boot", "--pause-at-end"]):
             return 1
         return 10    # 已在新窗口（管理员）里继续安装
-    xml_path = APP_DIR / "task.xml"
     script = Path(__file__).resolve()
     if mode == "boot":
         print("检查 SYSTEM 对程序目录的访问权限 ...")
         ensure_system_access(APP_DIR)
-    # boot 模式：按 BOOT_PRINCIPALS 逐个尝试，某个写法被系统拒绝就自动换下一个
-    variants = BOOT_PRINCIPALS if mode == "boot" else [("当前用户", None)]
-    registered = False
-    for label, principal in variants:
-        xml_path.write_text(task_xml(pythonw_path(), script, mode, principal), encoding="utf-16")
-        rc, out = run_cmd(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", str(xml_path), "/F"])
-        if verbose:
-            print(out[:600])
-        if rc == 0:
-            print(f"计划任务已注册（身份写法：{label}）")
-            log(f"计划任务已注册（mode={mode}, principal={label}）：{TASK_NAME}")
-            registered = True
-            break
-        log(f"计划任务注册失败（{label}）：{out}", "ERROR")
-        print(f"！该写法被拒绝（{label}）：{out.strip()[-260:]}")
-    if not registered:
-        print("！所有身份写法都被拒绝了，请把上面的内容发给我。")
-        return 1
+        # 先停掉旧守护进程并结束旧任务实例：新任务实例会被 IgnoreNew 策略挡住，
+        # 不结束掉的话重新安装后验证会"看起来没反应"
+        cmd_stop(cfg)
+        run_cmd(["schtasks", "/End", "/TN", TASK_NAME])
+        time.sleep(1)
+
+    print("注册计划任务 ...")
     if mode == "boot":
-        print("  触发：开机后 30 秒 + 之后每 1 分钟巡检")
-        print("  身份：SYSTEM（不需要任何人登录 Windows）")
+        # 常驻守护进程 + 看门狗（前者一直跑，后者保证前者一直活着）
+        if not register_task(TASK_NAME, script, mode, "daemon", verbose):
+            print("！主任务注册失败，请把上面的内容发给我。")
+            return 1
+        if not register_task(TASK_NAME_WATCHDOG, script, mode, "watchdog", verbose):
+            print("！看门狗任务注册失败（主任务已装好，功能仍可用）。")
     else:
-        print("  触发：用户登录后 30 秒 + 之后每 5 分钟巡检（需要用户已登录）")
+        if not register_task(TASK_NAME, script, mode, "once", verbose):
+            print("！任务注册失败，请把上面的内容发给我。")
+            return 1
+
     st = load_state()
     st["task_mode"] = mode
     save_state(st)
+    print()
+    if mode == "boot":
+        print("  模式：常驻守护（开机 30 秒拉起，之后一直活着）")
+        print("        看门狗每 5 分钟确认它还活着，死了/卡死自动重拉")
+        print("  身份：SYSTEM（不需要任何人登录 Windows）")
+        print("  巡检：在线每 25 秒 · 掉线 2~5 秒 · 失败 5→60 秒退避（永不长时间停摆）")
+    else:
+        print("  触发：用户登录后 30 秒 + 之后每 5 分钟巡检（需要用户已登录）")
+
     if verify:
         print()
-        if not verify_task_run(cfg):
+        ok = verify_daemon(cfg) if mode == "boot" else verify_task_run(cfg)
+        if not ok:
             print("！自动验证没通过，请把上面的输出发给我。")
             return 1
+    if mode == "boot":
+        # 注册后逐个确认任务真的存在（管理员身份下才能完整枚举）
+        print()
+        for name in (TASK_NAME, TASK_NAME_WATCHDOG):
+            r, o = run_cmd(["schtasks", "/Query", "/TN", name, "/FO", "LIST"])
+            print(f"  [{'OK' if r == 0 else '? '}] 确认任务存在：{name}")
+            if r != 0:
+                print(f"      {o.strip()[:160]}")
     return 0
 
 
 def uninstall_task(cfg) -> int:
-    rc, out = run_cmd(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
-    if rc == 0:
-        log("计划任务已删除（不再开机自启）")
-        print("已删除计划任务，开机不会再自动认证了。")
-    else:
-        print(out)
-    return 0 if rc == 0 else 1
+    for name in (TASK_NAME, TASK_NAME_WATCHDOG):
+        r, out = run_cmd(["schtasks", "/Delete", "/TN", name, "/F"])
+        if r == 0:
+            print(f"已删除计划任务：{name}")
+        else:
+            print(f"（{name}：{out.strip()[:110]}）")
+    cmd_stop(cfg)          # 顺手停掉守护进程
+    for f in APP_DIR.glob("task-*.xml"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+    log("计划任务已删除（不再开机自启），守护进程已停止")
+    print("已关闭开机自启，守护进程也已停止。")
+    return 0
 
 
 # =============================================================================
@@ -1224,6 +1680,26 @@ def cmd_status(cfg) -> int:
                 "logon": "仅登录后认证·当前用户身份"}.get(mode, "")
     print(f"计划任务   : {'已注册' + ('（' + mode_txt + '）' if mode_txt else '') if rc == 0 else '未注册'}")
     print(f"运行身份   : {run_identity()}")
+    # 守护进程 + 看门狗状态
+    running, info, age = daemon_status(cfg)
+    d = (st.get("daemon") or {})
+    if running:
+        print(f"守护进程   : 运行中（PID {info.get('pid')} · 状态 {d.get('state', '?')} · "
+              f"心跳 {age:.0f} 秒前）")
+    else:
+        if d:
+            print(f"守护进程   : 未运行（最后一次心跳 {d.get('last_beat_at', '?')}，"
+                  f"状态 {d.get('state', '?')}）")
+        else:
+            print("守护进程   : 未运行过")
+    rcw, outw = run_cmd(["schtasks", "/Query", "/TN", TASK_NAME_WATCHDOG])
+    if rcw == 0:
+        print("看门狗     : 已注册（每 5 分钟确认守护进程存活）")
+    elif "拒绝访问" in outw or "Access is denied" in outw:
+        print("看门狗     : 已注册但当前身份无权查看（以 SYSTEM 身份注册的任务，"
+              "用管理员身份运行 --status 可确认）")
+    else:
+        print("看门狗     : 未注册")
     return 0
 
 
@@ -1299,7 +1775,12 @@ def cmd_setup(cfg) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="GiWiFi 校园网开机自动认证（支持无人值守）")
     ap.add_argument("--once", "--task", dest="once", action="store_true", help="检查并按需认证一次（默认行为）")
-    ap.add_argument("--watch", action="store_true", help="常驻循环守护")
+    ap.add_argument("--watch", action="store_true", help="常驻守护（等价 --daemon，保留旧名）")
+    ap.add_argument("--daemon", action="store_true", help="常驻守护进程：时刻监测，断网立刻认证（推荐）")
+    ap.add_argument("--ensure-running", dest="ensure_running", action="store_true",
+                    help="看门狗：守护进程不在了就把它拉起来（计划任务每 5 分钟调用）")
+    ap.add_argument("--start", action="store_true", help="立即在后台拉起守护进程")
+    ap.add_argument("--stop", action="store_true", help="停止守护进程")
     ap.add_argument("--force", action="store_true", help="忽略在线检查，强制认证一次")
     ap.add_argument("--status", action="store_true", help="显示状态")
     ap.add_argument("--setup", action="store_true", help="安装向导（安装.bat 调用的就是它）")
@@ -1333,8 +1814,14 @@ def main() -> int:
                 rc = 0 if r in (0, 10) else r
             elif args.uninstall:
                 rc = uninstall_task(cfg)
-            elif args.watch:
-                rc = watch(cfg)
+            elif args.daemon or args.watch:
+                rc = cmd_daemon(cfg)
+            elif args.ensure_running:
+                rc = cmd_ensure_running(cfg)
+            elif args.start:
+                rc = cmd_start(cfg)
+            elif args.stop:
+                rc = cmd_stop(cfg)
             else:
                 rc = run_once(cfg, force=args.force)
     except Exception as e:

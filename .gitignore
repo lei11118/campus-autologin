@@ -2,9 +2,16 @@
 config.json
 state.json
 task.xml
+task-*.xml
+daemon.lock
 logs/
 
-# Python
+# 本机私有记录（含真实账号 / 内网 IP / 验证过程）
+本地记录.md
+本地记录-标记.md
+
+# 构建产物
+dist/
 __pycache__/
 *.pyc
 

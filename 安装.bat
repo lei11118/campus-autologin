@@ -20,18 +20,12 @@ where python >nul 2>nul
 if not errorlevel 1 set "PY=python"
 if defined PY goto run
 
-REM 3) common per-user / system install locations
-if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+REM 3) common install locations (version-agnostic: any Python 3.x)
+for /d %%p in ("%LOCALAPPDATA%\Programs\Python\Python*") do if not defined PY if exist "%%~fp\python.exe" set "PY=%%~fp\python.exe"
 if defined PY goto run
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+for /d %%p in ("%SystemDrive%\Python*") do if not defined PY if exist "%%~fp\python.exe" set "PY=%%~fp\python.exe"
 if defined PY goto run
-if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
-if defined PY goto run
-if exist "%SystemDrive%\Python314\python.exe" set "PY=%SystemDrive%\Python314\python.exe"
-if defined PY goto run
-if exist "%SystemDrive%\Python313\python.exe" set "PY=%SystemDrive%\Python313\python.exe"
-if defined PY goto run
-if exist "%SystemDrive%\Python312\python.exe" set "PY=%SystemDrive%\Python312\python.exe"
+for /d %%p in ("%ProgramFiles%\Python*") do if not defined PY if exist "%%~fp\python.exe" set "PY=%%~fp\python.exe"
 if defined PY goto run
 
 echo.

@@ -8,12 +8,22 @@
   "encrypt_key": "1234567887654321",
   "username": "在这里填校园网账号（手机号/学工号）",
   "password": "",
+  "timeout_s": 8,
+  "startup_wait_s": 60,
+  "verify_before_fail": true,
+
+  "watch_online_s": 25,
+  "watch_offline_s": 5,
+  "retry_steps_s": [5, 10, 20, 30, 60],
+  "cred_retry_min": 10,
+  "heartbeat_log_min": 30,
+  "daemon_stale_min": 10,
+  "log_max_mb": 2,
+
   "interval_min": 5,
   "max_fail": 3,
   "cooldown_min": 30,
-  "startup_wait_s": 60,
-  "verify_before_fail": true,
-  "timeout_s": 8,
+
   "_字段说明": {
     "portal": "门户地址。留空=自动发现（推荐）；也可写死内网地址如 http://10.0.0.1",
     "portal_path": "登录页路径（gportal 家族默认 /gportal/web/login）",
@@ -23,11 +33,20 @@
     "encrypt_key": "门户前端 JS 里 CryptoJS.AES.encrypt 用的 key（iv 由登录页下发，不要写死）",
     "username": "校园网认证账号",
     "password": "留空后由安装向导写入；明文 或 dpapi:<b64>(用户) / dpapim:<b64>(机器)",
-    "interval_min": "守护模式(--watch)的检查周期（分钟）",
-    "max_fail": "连续失败多少次进入冷却",
-    "cooldown_min": "冷却时长（分钟），防止把账号刷到要求验证码",
+    "timeout_s": "单次 HTTP 超时（秒）",
     "startup_wait_s": "开机时等网络就绪的最长等待（秒）",
     "verify_before_fail": "认证接口报错时先用探针复核，避免误判失败",
-    "timeout_s": "单次 HTTP 超时（秒）"
+
+    "watch_online_s": "【常驻守护】在线时的巡检间隔（秒），每次只发一个很小的探针请求",
+    "watch_offline_s": "【常驻守护】离线/无法判断时的巡检间隔（秒），掉线时快速重试",
+    "retry_steps_s": "【常驻守护】认证失败后的重试步进（秒）；到最后一个值后一直按它重试，不会长时间停摆",
+    "cred_retry_min": "【常驻守护】判定为账号/密码类错误时的重试间隔（分钟）",
+    "heartbeat_log_min": "【常驻守护】稳定运行时每隔多少分钟写一行心跳日志（避免日志膨胀）",
+    "daemon_stale_min": "【看门狗】心跳超过多少分钟没更新就判定守护进程卡死并重启",
+    "log_max_mb": "单个日志文件超过多少 MB 就轮转为 .log.1",
+
+    "interval_min": "【仅登录后模式】每次检查的间隔（分钟）",
+    "max_fail": "【仅登录后模式】连续失败多少次进入冷却（常驻守护模式不使用冷却）",
+    "cooldown_min": "【仅登录后模式】冷却时长（分钟）"
   }
 }
