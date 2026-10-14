@@ -64,7 +64,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 
-__version__ = "1.2.0"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
+__version__ = "1.2.1"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
 
 # 控制台输出兜底：即使被重定向到管道/文件，也不会因编码问题崩溃或报错
 for _s in (sys.stdout, sys.stderr):
@@ -758,6 +758,26 @@ def run_identity() -> str:
     return who
 
 
+def wait_online(cfg, timeout_s: int = 25) -> tuple:
+    """等的探针复核：认证成功后 AC 放行往往要 10~30 秒，别急着判失败。
+
+    实测教训（2026-10-14 事故）：旧版在认证成功后只等 1.5 秒复核，AC 还没放行就判
+    "复核仍未通网" → 计入失败 → 满 3 次 → 30 分钟冷却。一天之内因此被锁 8 次。
+    """
+    t0 = time.time()
+    delay = 1.5
+    res = (UNKNOWN, "尚未复核")
+    while True:
+        time.sleep(delay)
+        try:
+            res = check_online(cfg)[:2]
+        except Exception as e:
+            res = (UNKNOWN, f"复核探针异常：{e}")
+        if res[0] == ONLINE or (time.time() - t0) >= timeout_s:
+            return res
+        delay = min(8.0, delay * 2)
+
+
 def do_login(cfg, opener, parsed, login_url) -> tuple:
     """执行一次认证，返回 (成功?, 说明, reasoncode)"""
     username = cfg["username"]
@@ -904,9 +924,8 @@ def run_once(cfg, force: bool = False, verbose: bool = True) -> int:
         return 1
 
     log(msg)
-    # 复核：认证接口说成功，也要用探针确认真的通了
-    time.sleep(1.5)
-    status2, why2, _ = check_online(cfg)
+    # 复核：认证接口说成功，也要用探针确认真的通了（AC 放行有延迟，给它最多 25 秒）
+    status2, why2 = wait_online(cfg, 25)
     if status2 == ONLINE:
         log(f"复核通过：{why2}")
         st = load_state()
@@ -914,12 +933,12 @@ def run_once(cfg, force: bool = False, verbose: bool = True) -> int:
                    "last_ok_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
         save_state(st)
         return 0
-    log(f"认证接口返回成功，但复核仍未通网：{why2}", "WARN")
+    # 接口已报成功、只是还没放行：**绝不计入失败**（否则又会"登录成功却被锁 30 分钟"）
+    log(f"认证接口返回成功，但复核仍未通网（AC 放行延迟，不计失败）：{why2}", "WARN")
     st = load_state()
-    st["fail_count"] = st.get("fail_count", 0) + 1
-    st["last_fail_ts"] = time.time()
+    st["recheck_pending_ts"] = time.time()
     save_state(st)
-    return 1
+    return 0
 
 
 # =============================================================================

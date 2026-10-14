@@ -40,6 +40,7 @@ PAYLOAD = [
     ("tests/_selfcheck_acl.py", "tests/_selfcheck_acl.py"),
     ("tests/check_discovery.py", "tests/check_discovery.py"),
     ("tests/check_watchdog.py", "tests/check_watchdog.py"),
+    ("tests/check_recheck.py", "tests/check_recheck.py"),
 ]
 
 
