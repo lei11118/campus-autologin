@@ -1,6 +1,6 @@
 # 校园网自动认证（常驻守护版）
 
-> 📦 **下载**：到 [Releases](https://github.com/lei11118/campus-autologin/releases/latest) 下载 `campus-autologin-setup-v1.2.1.exe`（自解压一键安装）或便携 zip。
+> 📦 **下载**：到 [Releases](https://github.com/lei11118/campus-autologin/releases/latest) 下载 `campus-autologin-setup-v1.2.2.exe`（自解压一键安装）或便携 zip。
 >
 > 💡 如果拿到的是 **`campus-autologin-setup-*.exe`**：直接双击，它会自动解压到
 > `%LOCALAPPDATA%\campus-autologin` 并立刻启动安装向导（解压不需要管理员；
@@ -12,7 +12,7 @@
 - **零第三方依赖**：纯 Python 标准库 + Windows DPAPI（不需要 pip install 任何东西）
 - **零配置迁移**：整个目录拷到别的机器就能用；门户地址自动发现，不用手填内网 IP
 - **常驻守护**：一个常驻进程 + 一个看门狗，开机即拉起，平时几乎不占资源（实测 **CPU ≈0.05% 单核 / 内存 ~35MB**）
-- **版本**：v1.2.1 · 标记 ID `CAMPUS-NET-AUTOLOGIN`
+- **版本**：v1.2.2 · 标记 ID `CAMPUS-NET-AUTOLOGIN`
 
 > 已在 GiWiFi「校园助手」gportal 门户（`/gportal/web/login` + `authLogin`）上实机验证：
 > 字节级复刻前端加密、SYSTEM 身份下完成真实认证、掉线自动重连。
@@ -160,6 +160,7 @@ Windows 开机
 | `无法判断联网状态` | 不在校园网内 / 网线没插 / DHCP 没拿到地址 |
 | `密码解密失败` | 存的是**用户范围** DPAPI 而任务以 SYSTEM 运行 → 重设密码并选 [1] 或 [2] |
 | `准备阶段失败：未能确定门户地址` | 不在校园网内 |
+| 双击 bat 报 `'"py -3"' 不是内部或外部命令` | 旧版启动器 bug（v1.2.2 已修）：已改成"可执行文件与参数分开调用"。拉新版，或把 bat 里 `"%PY%" "%~dp0giwifi_auth.py" ...` 改成 `"%PY%" %PYARG% "%~dp0giwifi_auth.py" ...` |
 | `看门狗：未发现存活的守护进程，正在拉起 ...` | 守护进程曾退出/卡死，看门狗已自动恢复 ✅ |
 | `守护进程 PID x 心跳已 N 分钟没更新（判定卡死），强制重启` | 同上，进程假死被强杀重拉 ✅ |
 

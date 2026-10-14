@@ -64,7 +64,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 
-__version__ = "1.2.1"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
+__version__ = "1.2.2"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
 
 # 控制台输出兜底：即使被重定向到管道/文件，也不会因编码问题崩溃或报错
 for _s in (sys.stdout, sys.stderr):

@@ -9,10 +9,15 @@ REM =====================================================================
 setlocal
 cd /d "%~dp0"
 set "PY="
+set "PYARG="
 
-REM 1) the "py" launcher (python.org installs)
+REM 1) the "py" launcher (python.org installs).
+REM    NOTE: keep the exe and its arguments in SEPARATE variables. If PY held
+REM    "py -3", then "%PY%" would quote the whole thing and cmd would hunt for
+REM    a file literally named 'py -3' -> "not recognized as an internal command".
 where py >nul 2>nul
-if not errorlevel 1 set "PY=py -3"
+if not errorlevel 1 set "PY=py"
+if not errorlevel 1 set "PYARG=-3"
 if defined PY goto run
 
 REM 2) python.exe on PATH
@@ -37,7 +42,7 @@ pause
 exit /b 1
 
 :run
-"%PY%" "%~dp0giwifi_auth.py" --setup
+"%PY%" %PYARG% "%~dp0giwifi_auth.py" --setup
 if errorlevel 1 echo   [i] the program exited with code %errorlevel%
 echo.
 pause

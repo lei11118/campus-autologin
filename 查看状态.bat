@@ -3,9 +3,12 @@ REM ASCII-only launcher: show current status (network / account / task).
 setlocal
 cd /d "%~dp0"
 set "PY="
+set "PYARG="
 
+REM the "py" launcher: keep exe and args separate ("%PY%" must never hold "py -3")
 where py >nul 2>nul
-if not errorlevel 1 set "PY=py -3"
+if not errorlevel 1 set "PY=py"
+if not errorlevel 1 set "PYARG=-3"
 if defined PY goto run
 
 where python >nul 2>nul
@@ -25,6 +28,6 @@ pause
 exit /b 1
 
 :run
-"%PY%" "%~dp0giwifi_auth.py" --status
+"%PY%" %PYARG% "%~dp0giwifi_auth.py" --status
 echo.
 pause
