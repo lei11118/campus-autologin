@@ -64,7 +64,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 
-__version__ = "1.2.2"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
+__version__ = "1.2.3"      # 常驻守护版：时刻监测、断网即刻认证、自愈看门狗、云端可移植
 
 # 控制台输出兜底：即使被重定向到管道/文件，也不会因编码问题崩溃或报错
 for _s in (sys.stdout, sys.stderr):
@@ -136,7 +136,7 @@ DEFAULT_CONFIG = {
     "retry_steps_s": [5, 10, 20, 30, 60],      # 认证失败后的重试步进（秒），封顶后一直按 60s 重试
     "cred_retry_min": 10,                      # 判定为账号/密码类错误时的重试间隔（分钟）
     "heartbeat_log_min": 30,                   # 稳定运行时每多少分钟写一行心跳日志
-    "daemon_stale_min": 10,                    # 看门狗判定守护进程卡死的阈值（分钟）
+    "daemon_stale_min": 3,                     # 看门狗判定守护进程卡死的阈值（分钟）；守护进程每 25s 心跳一次，3 分钟=错过 7 次，肯定死了
     "log_max_mb": 2,                           # 单个日志文件超过多少 MB 就轮转
 }
 
@@ -1015,7 +1015,7 @@ def daemon_status(cfg) -> tuple:
     pid = int(st.get("pid") or info.get("pid") or 0)
     hb = float(st.get("last_beat_ts") or 0)
     age = (time.time() - hb) if hb else 1e9
-    stale = int(cfg.get("daemon_stale_min", 10)) * 60
+    stale = int(cfg.get("daemon_stale_min", 3)) * 60
     merged = dict(info)
     merged.update({k: v for k, v in st.items() if v is not None})
     merged["pid"] = pid
@@ -1073,8 +1073,13 @@ def cmd_daemon(cfg) -> int:
     running, info, age = daemon_status(cfg)
     other = int(info.get("pid") or 0)
     if running and other != os.getpid():
-        log(f"已有守护进程在运行（PID {other}，心跳 {age:.0f}s 前），本实例退出")
-        return 0
+        # 心跳"新鲜"但已过去 90 秒，且我们有权限确认那个进程确实没了（典型场景：机器刚重启/
+        # 休眠唤醒，旧守护进程已随关机消失，但心跳文件还在）→ 直接接管，别干等 stale 超时。
+        if age > 90 and pid_state(other) == "dead":
+            log(f"发现 {age:.0f}s 前的心跳来自已不存在的进程 {other}（机器刚重启？），本实例接管", "WARN")
+        else:
+            log(f"已有守护进程在运行（PID {other}，心跳 {age:.0f}s 前），本实例退出")
+            return 0
     if (not running) and other and other != os.getpid() and pid_state(other) == "alive":
         log(f"另一个守护进程（PID {other}）心跳已过期但进程仍在（疑似卡死），"
             f"交给看门狗处理，本实例退出", "WARN")
@@ -1530,6 +1535,21 @@ def ensure_system_access(path: Path) -> bool:
     return False
 
 
+def existing_task_dir(name: str):
+    """现有任务指向的程序目录（读不到就返回 None —— 非管理员查 SYSTEM 任务会被拒绝）"""
+    rc, out = run_cmd(["schtasks", "/Query", "/TN", name, "/XML"])
+    if rc != 0:
+        return None
+    i = out.find("<WorkingDirectory>")
+    if i < 0:
+        return None
+    j = out.find("</WorkingDirectory>", i)
+    if j < 0:
+        return None
+    val = out[i + len("<WorkingDirectory>"):j].strip()
+    return val or None
+
+
 def install_task(cfg, mode: str = "boot", verbose: bool = False, verify: bool = True) -> int:
     if mode == "boot" and not is_admin():
         print("「开机即认证（SYSTEM 身份、无需登录 Windows）」需要管理员权限。")
@@ -1545,6 +1565,16 @@ def install_task(cfg, mode: str = "boot", verbose: bool = False, verify: bool = 
         cmd_stop(cfg)
         run_cmd(["schtasks", "/End", "/TN", TASK_NAME])
         time.sleep(1)
+        # 防"多副本互抢"：同一个工具被复制成多份时，任务名相同、谁最后安装谁生效。
+        # 实测踩过：D:\temporary 里的测试副本把正式目录的任务顶掉，导致整天认证失败。
+        old_dir = existing_task_dir(TASK_NAME)
+        if old_dir and os.path.normcase(old_dir.rstrip("\\")) != os.path.normcase(str(APP_DIR).rstrip("\\")):
+            print()
+            print(f"！注意：现有开机任务指向的是【另一个目录】：{old_dir}")
+            print(f"        本次安装会把它改为本目录：{APP_DIR}")
+            print("        （同一工具请只保留一份；多余的副本建议删掉，否则会互相抢任务）")
+            print()
+            time.sleep(2)
 
     print("注册计划任务 ...")
     if mode == "boot":

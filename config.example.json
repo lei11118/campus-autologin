@@ -17,7 +17,7 @@
   "retry_steps_s": [5, 10, 20, 30, 60],
   "cred_retry_min": 10,
   "heartbeat_log_min": 30,
-  "daemon_stale_min": 10,
+  "daemon_stale_min": 3,
   "log_max_mb": 2,
 
   "interval_min": 5,
@@ -42,7 +42,7 @@
     "retry_steps_s": "【常驻守护】认证失败后的重试步进（秒）；到最后一个值后一直按它重试，不会长时间停摆",
     "cred_retry_min": "【常驻守护】判定为账号/密码类错误时的重试间隔（分钟）",
     "heartbeat_log_min": "【常驻守护】稳定运行时每隔多少分钟写一行心跳日志（避免日志膨胀）",
-    "daemon_stale_min": "【看门狗】心跳超过多少分钟没更新就判定守护进程卡死并重启",
+    "daemon_stale_min": "【看门狗】心跳超过多少分钟没更新就判定守护进程卡死并重启（默认 3；守护进程每 25s 心跳一次）",
     "log_max_mb": "单个日志文件超过多少 MB 就轮转为 .log.1",
 
     "interval_min": "【仅登录后模式】每次检查的间隔（分钟）",
